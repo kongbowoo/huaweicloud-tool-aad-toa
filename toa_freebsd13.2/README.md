@@ -49,6 +49,17 @@ toa_load="YES"
 toa.scope="10.0.0.0/8"
 ```
 
+## 单元测试
+
+纯逻辑层（TCP option 解析、IP/scope 解析、哈希）抽取在 `toa_core.c`，内核模块与用户态测试共用同一份代码。测试可在任何带 C11 编译器的机器上运行（无需 FreeBSD）：
+
+```shell
+make -C tests test
+# 输出 "UT: N passed, 0 failed" 即通过
+```
+
+覆盖范围：IP 解析的合法/非法路径、scope 掩码边界与错误回滚、TOA option 的截断/重叠/EOL/多层防护、哈希确定性与分布。
+
 ## 验证
 
 ```shell

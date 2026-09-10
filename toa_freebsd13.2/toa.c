@@ -11,6 +11,9 @@
  *   tcp_v4_syn_recv_sock hook  -> five-tuple hash table filled from the hook
  *   inet_getname hook          -> replace tcp_usrreqs.pru_peeraddr
  *
+ * Pure logic (option/scope parsing, hashing) lives in toa_core.c and is
+ * unit-tested in userland under tests/.
+ *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
@@ -43,36 +46,19 @@
 #include <netinet/in_pcb_var.h>
 #include <netinet/tcp_var.h>
 
+#include "toa_core.h"
+
 VNET_DECLARE(struct pfil_head, inet_pfil_head);
 #define	V_inet_pfil_head	VNET(inet_pfil_head)
 
-/* ---- TOA protocol constants (must match the proxy side / Linux toa.h) ---- */
-
-#define TCPOPT_TOA	254
-#define TCPOLEN_TOA	8		/* |opcode|size|ip+port| = 1 + 1 + 6 */
-
-struct toa_data {
-	uint8_t		opcode;
-	uint8_t		opsize;
-	uint16_t	port;		/* network byte order */
-	uint32_t	ip;		/* network byte order */
-};
-
-_Static_assert(sizeof(struct toa_data) == 8, "toa_data must be 8 bytes");
-
 /* ---- tunables ---- */
 
-#define TOA_HASH_SIZE		1024	/* power of two */
 #define TOA_MAX_ENTRIES		65536
 #define TOA_ENTRY_TTL		300	/* seconds */
 #define TOA_GC_INTERVAL		60	/* seconds */
-#define TOA_MAX_SCOPE		5
-#define TOA_SCOPE_STR_MAX	256
 
 static char	toa_scope_boot[TOA_SCOPE_STR_MAX];
 TUNABLE_STR_FETCH("toa.scope", toa_scope_boot, sizeof(toa_scope_boot));
-
-static char	toa_scope_str[TOA_SCOPE_STR_MAX];
 
 /* ---- real-address cache ---- */
 
@@ -93,15 +79,6 @@ static struct rmlock		toa_rm;
 static struct callout		toa_gc_callout;
 static volatile int		toa_nentries;
 
-/* source address scope, protected by toa_rm */
-struct toa_scope {
-	uint32_t		begin;		/* host order */
-	uint32_t		end;		/* host order */
-};
-
-static struct toa_scope	toa_scopes[TOA_MAX_SCOPE];
-static int		toa_nscope;
-
 /* ---- statistics ---- */
 
 static counter_u64_t	toa_stat_syn_toa;
@@ -120,119 +97,8 @@ static int (*toa_orig_peeraddr)(struct socket *so, struct sockaddr **nam);
 static MALLOC_DEFINE(M_TOA, "toa", "TOA real client address cache");
 
 /* ------------------------------------------------------------------ */
-/* helpers                                                             */
-/* ------------------------------------------------------------------ */
-
-static uint32_t
-toa_in_aton(const char *str, int *ok)
-{
-	uint32_t addr = 0;
-	int octet = 0, ndots = 0, digits = 0;
-
-	*ok = 0;
-	while (*str != '\0') {
-		if (*str == '.') {
-			if (digits == 0 || octet > 255 || ndots >= 3)
-				return (0);
-			addr = (addr << 8) | octet;
-			octet = 0;
-			digits = 0;
-			ndots++;
-		} else if (*str >= '0' && *str <= '9') {
-			octet = octet * 10 + (*str - '0');
-			digits++;
-			if (octet > 255)
-				return (0);
-		} else {
-			return (0);
-		}
-		str++;
-	}
-	if (ndots != 3 || digits == 0 || octet > 255)
-		return (0);
-	addr = (addr << 8) | octet;
-	*ok = 1;
-	return (addr);
-}
-
-static int
-toa_in_scope(uint32_t saddr)
-{
-	int i;
-
-	if (toa_nscope == 0)
-		return (1);
-	for (i = 0; i < toa_nscope; i++) {
-		if (saddr >= toa_scopes[i].begin && saddr <= toa_scopes[i].end)
-			return (1);
-	}
-	return (0);
-}
-
-/* parse "a.b.c.d/nn,a.b.c.d/nn..." into toa_scopes[], caller holds rm_wlock */
-static int
-toa_scope_parse(const char *s)
-{
-	char buf[TOA_SCOPE_STR_MAX];
-	char echo[TOA_SCOPE_STR_MAX];
-	char *cur, *tok, *slash;
-	uint32_t ip, mask;
-	int n, bits, ok;
-
-	n = 0;
-	strlcpy(buf, s, sizeof(buf));
-	strlcpy(echo, s, sizeof(echo));
-	cur = buf;
-	while ((tok = strsep(&cur, ",;")) != NULL) {
-		if (*tok == '\0')
-			continue;
-		if (n >= TOA_MAX_SCOPE) {
-			printf("TOA: too many scopes, max %d\n", TOA_MAX_SCOPE);
-			return (-1);
-		}
-		slash = strchr(tok, '/');
-		if (slash == NULL) {
-			printf("TOA: invalid scope entry \"%s\"\n", tok);
-			return (-1);
-		}
-		*slash = '\0';
-		bits = strtol(slash + 1, NULL, 10);
-		if (bits <= 0 || bits > 32) {
-			printf("TOA: invalid mask \"%s\"\n", slash + 1);
-			return (-1);
-		}
-		ip = ntohl(toa_in_aton(tok, &ok));
-		if (ok == 0) {
-			printf("TOA: invalid ip \"%s\"\n", tok);
-			return (-1);
-		}
-		mask = bits == 32 ? 0xffffffffu : ~((1u << (32 - bits)) - 1);
-		toa_scopes[n].begin = ip & mask;
-		toa_scopes[n].end = ip | ~mask;
-		n++;
-	}
-	toa_nscope = n;
-	strlcpy(toa_scope_str, echo, sizeof(toa_scope_str));
-	return (0);
-}
-
-/* ------------------------------------------------------------------ */
 /* real-address hash table                                             */
 /* ------------------------------------------------------------------ */
-
-static uint32_t
-toa_hash(uint32_t faddr, uint16_t fport, uint32_t laddr, uint16_t lport)
-{
-	uint32_t h;
-
-	h = faddr ^ laddr ^ ((uint32_t)fport << 16) ^ (uint32_t)lport;
-	h ^= h >> 16;
-	h *= 0x85ebca6bU;
-	h ^= h >> 13;
-	h *= 0xc2b2ae35U;
-	h ^= h >> 16;
-	return (h & (TOA_HASH_SIZE - 1));
-}
 
 static struct toa_entry *
 toa_lookup(uint32_t faddr, uint16_t fport, uint32_t laddr, uint16_t lport)
@@ -320,41 +186,6 @@ toa_gc(void *arg __unused)
 /* ------------------------------------------------------------------ */
 /* pfil hook: parse TOA option from inbound SYN                        */
 /* ------------------------------------------------------------------ */
-
-static int
-toa_find_toa(const uint8_t *ptr, int length, struct toa_data *out)
-{
-	struct toa_data tdata;
-	int opcode, opsize, toa_lay = -1;
-
-	while (length > 0) {
-		opcode = *ptr++;
-		switch (opcode) {
-		case TCPOPT_EOL:
-			return (-1);
-		case TCPOPT_NOP:
-			length--;
-			continue;
-		default:
-			opsize = *ptr++;
-			if (opsize < 2 || opsize > length)
-				return (-1);
-			if (opcode == TCPOPT_TOA && opsize == TCPOLEN_TOA) {
-				toa_lay++;
-				if (toa_lay >= 3)
-					return (-1);
-				memcpy(&tdata, ptr - 2, sizeof(tdata));
-			}
-			ptr += opsize - 2;
-			length -= opsize;
-		}
-	}
-	if (toa_lay != -1) {
-		memcpy(out, &tdata, sizeof(*out));
-		return (0);
-	}
-	return (-1);
-}
 
 static int
 toa_pfil(void *arg __unused, struct mbuf **mp, struct ifnet *ifp __unused,

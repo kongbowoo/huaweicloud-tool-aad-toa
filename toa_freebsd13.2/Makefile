@@ -1,6 +1,6 @@
 KMOD=	toa
-SRCS=	toa.c
+SRCS=	toa.c toa_core.c
 
-CFLAGS+= -Wall -Wextra
+CFLAGS+= -Wall -Wextra -I.
 
 .include <bsd.kmod.mk>
