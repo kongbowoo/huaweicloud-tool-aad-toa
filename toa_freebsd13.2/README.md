@@ -1,6 +1,6 @@
 # TOA for FreeBSD 13.2
 
-华为高防（AAD）TOA 模块的 FreeBSD 13.2 移植版，在服务端解析 TCP option（opcode 254）中携带的真实客户端 IP/Port，供 `getpeername()`/`getsockname()` 返回真实源地址。
+华为高防（AAD）TOA 模块的 FreeBSD 13.2 移植版，在服务端解析 TCP option（opcode 254）中携带的真实客户端 IP/Port，供 `getpeername()` 返回真实源地址。
 
 ## 与 Linux 版的实现差异
 
@@ -64,5 +64,7 @@ sysctl net.inet.toa.syn_recv_sock_toa net.inet.toa.getname_toa_ok
 - 上游高防必须开启 TOA 回源；中间设备剥离 option 254 即失效（与 Linux 版一致）。
 - syncookies 模式下 ACK 握手无 TOA option，对应连接返回代理地址（与 Linux 版行为一致）。
 - SYN 重传会覆盖表项，幂等安全；表项 TTL 300 秒由 callout 每 60 秒回收。
+- 表项过期后查表 miss，`getpeername` 返回代理地址。Linux 版数据挂在 socket 上随连接存活，本实现依赖全局表：连接存活超过 TTL（编译期常量 `TOA_ENTRY_TTL`，默认 300 秒）后才查询的场景（keepalive upstream、WebSocket、数据库长连接）会退化为代理地址，可按需调大重编。
+- `kldunload` 不等待在途的 pfil/peeraddr 调用返回，卸载前需停止业务流量。
 - 仅支持 IPv4 与 IPv4-mapped-IPv6（v6 原生地址返回代理地址）；pfil hook 挂在 `inet_pfil_head`，VIMAGE 内核下默认 vnet 生效。
 - 内核升级（13.2 -> 13.x/14）需重新编译；`pfil`/`pru_peeraddr` API 在 13.x 内稳定。

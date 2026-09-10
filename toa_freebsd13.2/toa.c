@@ -4,7 +4,7 @@
  * FreeBSD port of the huaweicloud-tool-aad-toa Linux kernel module.
  * Parses the real client {IP, Port} carried in TCP option (opcode 254)
  * inserted by the AAD/LVS FULLNAT proxy on SYN packets, and serves it
- * back through getpeername()/getsockname().
+ * back through getpeername().
  *
  * Implementation map (Linux -> FreeBSD):
  *   get_toa_data()/skb parse   -> pfil(9) inbound IPv4 hook, mbuf parse
@@ -174,12 +174,14 @@ static int
 toa_scope_parse(const char *s)
 {
 	char buf[TOA_SCOPE_STR_MAX];
+	char echo[TOA_SCOPE_STR_MAX];
 	char *cur, *tok, *slash;
 	uint32_t ip, mask;
 	int n, bits, ok;
 
 	n = 0;
 	strlcpy(buf, s, sizeof(buf));
+	strlcpy(echo, s, sizeof(echo));
 	cur = buf;
 	while ((tok = strsep(&cur, ",;")) != NULL) {
 		if (*tok == '\0')
@@ -210,7 +212,7 @@ toa_scope_parse(const char *s)
 		n++;
 	}
 	toa_nscope = n;
-	strlcpy(toa_scope_str, buf, sizeof(toa_scope_str));
+	strlcpy(toa_scope_str, echo, sizeof(toa_scope_str));
 	return (0);
 }
 
@@ -371,6 +373,8 @@ toa_pfil(void *arg __unused, struct mbuf **mp, struct ifnet *ifp __unused,
 	ip = mtod(m, struct ip *);
 	if (ip->ip_v != IPVERSION || ip->ip_p != IPPROTO_TCP)
 		return (PFIL_PASS);
+	if ((ntohs(ip->ip_off) & IP_OFFMASK) != 0)
+		return (PFIL_PASS);	/* non-first fragment */
 	hlen = ip->ip_hl << 2;
 	if (hlen < sizeof(struct ip))
 		return (PFIL_PASS);
@@ -482,7 +486,7 @@ toa_sysctl_scope(SYSCTL_HANDLER_ARGS)
 		return (error);
 
 	rm_wlock(&toa_rm);
-	error = toa_scope_parse(buf);
+	error = toa_scope_parse(buf) == 0 ? 0 : EINVAL;
 	rm_wunlock(&toa_rm);
 	return (error);
 }
