@@ -1,6 +1,6 @@
 # huaweicloud-tool-aad-toa
 
-简体中文 | [English](README_EN.md)
+[简体中文](README.md) | English
 
 Dedicated TOA (TCP Option Address) kernel module for Huawei Cloud Advanced Anti-DDoS ([AAD](https://www.huaweicloud.com/product/aad.html)), optimized on top of the open-source TOA module originally developed by Taobao. It resolves the real client source IP on the server side and can be built and installed directly on Linux / FreeBSD servers.
 
